@@ -1,404 +1,383 @@
-# LSM-Tree 读放大、写放大、空间放大 — 原理与数据湖演进
-
-> HBase → Iceberg → Paimon+Flink → Doris 各系统如何站在前人肩膀上解决放大问题
+# LSM-Tree：为什么大数据组件都选择它，以及它要付出什么代价
 
 ---
 
-## 零、LSM-Tree 是什么，为什么它必须"放大"
+## 一、LSM-Tree 是什么，为什么那么多大数据组件都用它
 
-### 0.1 先理解问题：磁盘最怕什么
+### 1.1 传统数据库的瓶颈：磁盘最怕随机写
 
 ```
-机械硬盘 (HDD):
-  顺序写: ~200 MB/s
-  随机写: ~1 MB/s       ← 差 200 倍
-
-固态硬盘 (SSD):
-  顺序写: ~3000 MB/s
-  随机写: ~500 MB/s     ← 差 6 倍，且随机写加速 SSD 磨损
+机械硬盘 (HDD):                         固态硬盘 (SSD):
+  顺序写: ~200 MB/s                        顺序写: ~3000 MB/s
+  随机写: ~1 MB/s  ← 差 200 倍             随机写: ~500 MB/s  ← 差 6 倍, 且加速磨损
 ```
 
-传统数据库（MySQL InnoDB、PostgreSQL）用 B+Tree：
+MySQL InnoDB、PostgreSQL 使用 B+Tree：
 
 ```
 B+Tree 写入一条记录:
-  1. 读取目标 Page (通常 16KB) ← 随机读
-  2. 修改 Page 中的几十字节
-  3. 写回整个 Page            ← 随机写
+  1. 读取目标 Page (16KB)  ← 随机读
+  2. 修改 Page 中几十字节
+  3. 写回整个 Page          ← 随机写
   4. 可能触发页分裂 → 再写几个 Page
 
 每次写入 = 多次随机 IO
-当写入量达到每秒数万~数十万条时，B+Tree 的随机 IO 成为瓶颈
+写入量达到每秒数万~数十万条时，B+Tree 随机 IO 成为瓶颈
 ```
 
-### 0.2 LSM-Tree 的核心设计：拿"放大"换"速度"
+这在传统 OLTP（每秒几千 TPS）下不是问题，但在大数据场景——日志、IoT 传感器、CDC 变更流、时序数据——**每秒数十万甚至百万条写入**时，B+Tree 撑不住。
 
-LSM-Tree (Log-Structured Merge-Tree) 由 Patrick O'Neil 于 1996 年提出，核心思想：
+### 1.2 论文起源
 
-> **把所有随机写变成顺序写，代价是后台必须做合并（Compaction），合并带来放大。**
+**1996 年**，Patrick O'Neil、Edward Cheng、Dieter Gawlick、Elizabeth O'Neil 在 Acta Informatica 发表论文：
 
-```
-B+Tree:  写入时就把数据放到"正确位置" → 随机写 → 慢，但读快
-LSM-Tree: 写入时只追加到内存/文件末尾 → 顺序写 → 快，但数据无序，读要多查几个地方
-```
+> *"The Log-Structured Merge-Tree (LSM-Tree)"*
 
-这不是设计缺陷，而是**有意为之的 trade-off**。
+O'Neil 来自 **University of Massachusetts Boston**，核心洞察：
 
-### 0.3 LSM-Tree 完整写入流程
+> 既然磁盘的顺序写比随机写快 100~200 倍，那为什么不把所有写入都变成顺序写？代价是后台需要合并（Compaction），但这个合并也是顺序读写，总体吞吐远高于 B+Tree。
 
-```
-Step 1: 写入 MemTable（内存，红黑树/跳表，有序）
-        ┌──────────────────────┐
-        │  MemTable (sorted)   │  ← 所有写入先到这里，纯内存操作
-        │  key=A → v3          │
-        │  key=B → v1          │
-        │  key=C → v2          │
-        └──────────┬───────────┘
-                   │ 满了 (如 64MB)
-                   ↓
-Step 2: Flush 为 SSTable（Sorted String Table，不可变有序文件）
-        ┌──────────────────────┐
-        │  L0/sst_001.dat      │  ← 一次顺序写，整个文件有序
-        │  [A:v3, B:v1, C:v2]  │
-        └──────────────────────┘
-        ┌──────────────────────┐
-        │  L0/sst_002.dat      │  ← 又一次 Flush
-        │  [A:v5, D:v1, E:v1]  │     注意：A 出现了两次（v3 和 v5）
-        └──────────────────────┘
-                   │ L0 文件太多了
-                   ↓
-Step 3: Compaction（后台合并）
-        读取 sst_001 + sst_002
-        → 合并排序 → A 取最新 v5，B/C/D/E 保留
-        → 写出新文件 sst_003 到 L1
-        → 删除 sst_001, sst_002
+论文在发表后相当长时间内只是学术成果，直到互联网规模爆发才被工业界大规模采用。
 
-        这一步就是"放大"的来源：
-        sst_001 的数据被读出→合并→重新写入 sst_003
-        同样的数据被写了两次（甚至更多次，因为 L1→L2 还会再合并）
-```
-
-### 0.4 为什么必须 Compaction — 不合并会怎样
+### 1.3 谁第一个实践？
 
 ```
-假设从不做 Compaction:
-  写入 100 万次 → 产生 100 万个 SST 文件 (每次 Flush 一个)
-
-查询 key=X:
-  → 不知道 X 在哪个文件
-  → 必须从最新到最旧逐个查: sst_1000000, sst_999999, ..., sst_1
-  → 最坏情况: 扫描全部 100 万个文件
-  → 读放大 = 100 万倍
-  → 完全不可用
-
-空间问题:
-  → key=A 被更新了 1000 次，100 万个文件中有 1000 个包含 A 的旧版本
-  → 999 个是垃圾，但没人清理
-  → 空间放大 = 1000x
+时间线:
+  1996  论文发表 (O'Neil et al.)
+          │
+          │  (沉寂 ~10 年，学术界讨论，工业界未大规模采用)
+          │
+  2006  Google Bigtable 论文
+          │  内部使用 GFS + Tablet Server (MemTable → SSTable → Compaction)
+          │  这是 LSM-Tree 思想的第一个超大规模工业实践
+          │  但 Bigtable 是 Google 内部系统，未开源
+          │
+  2008  Apache HBase
+          │  Bigtable 的开源复刻，Hadoop 生态
+          │  第一个让普通公司也能用上 LSM-Tree 的系统
+          │  暴露了 LSM 的所有经典问题 (Compaction 风暴、读放大、HDFS 空间放大)
+          │
+  2011  Google LevelDB
+          │  Jeff Dean 和 Sanjay Ghemawat 编写的精简 LSM 实现
+          │  ~15000 行 C++ 代码，定义了 MemTable→SSTable→Compaction 标准范式
+          │  单线程，教科书级别，几乎所有后续实现的起点
+          │
+  2012  Facebook RocksDB
+          │  Fork LevelDB，加入多线程 Compaction、Column Family、Universal Compaction
+          │  成为工业界事实标准，被 TiKV、Pegasus、FoundationDB 等直接使用
+          │
+  2012+ 爆发式扩散
+       ├── Cassandra (DataStax, 分布式 LSM)
+       ├── ScyllaDB (C++ 重写 Cassandra)
+       ├── TiKV/TiDB (PingCAP, RocksDB 深度定制)
+       ├── OceanBase (蚂蚁集团, 自研 LSM)
+       ├── CockroachDB/Pebble (Go 重写 LSM)
+       ├── Doris/StarRocks (列式 LSM OLAP)
+       ├── X-Engine (阿里巴巴, FPGA 加速 LSM)
+       ├── TerarkDB (字节跳动, 压缩上直接搜索)
+       └── Paimon (数据湖格式内置 LSM)
 ```
 
-**所以 Compaction 不是可选的，是必须的。放大是"维持可用性"的代价。**
+**真实历史的关键点**：
+- Bigtable（2006）是 LSM-Tree 从论文到工业的转折点，但它不开源
+- HBase（2008）让 LSM-Tree 普及，但也第一个大规模暴露了放大问题
+- LevelDB（2011）不是第一个实践者，而是第一个干净的参考实现
+- RocksDB（2012）才是今天工业界的事实标准
 
-### 0.5 三种放大的根因图
+### 1.4 为什么这些组件都选择 LSM-Tree
 
-```
-                        LSM-Tree 的设计决策
-                               │
-              ┌────────────────┼────────────────┐
-              │                │                │
-       写入只追加不覆盖    数据分散在多层文件    旧版本不立即删除
-              │                │                │
-              ↓                ↓                ↓
-      Compaction 必须合并  查询必须多文件查找   过期数据占空间
-      同一数据反复读写      才能拿到最新值        直到 Compaction 清理
-              │                │                │
-              ↓                ↓                ↓
-          写放大            读放大            空间放大
-    (Write Amplification) (Read Amplification) (Space Amplification)
-```
+| 指标 | B+Tree (InnoDB) | LSM-Tree (RocksDB) | 倍数 |
+|------|----------------|-------------------|------|
+| 随机写吞吐 | ~5,000 TPS | ~50,000+ TPS | **10x** |
+| 顺序写吞吐 | ~20,000 TPS | ~200,000+ TPS | **10x** |
+| 点查延迟 | O(log N) 稳定 | O(L) L=层数，有波动 | B+Tree 略优 |
+| 范围查询 | 快（叶节点有序链表） | 需合并多层（较慢） | B+Tree 优 |
+| 空间利用率 | ~50-70% (页分裂碎片) | ~80-95% (Compaction 后紧凑) | LSM 优 |
 
-### 0.6 LSM-Tree vs B+Tree 定量对比
+**结论**：LSM-Tree 用后台 Compaction 的代价，换来 10 倍以上写入吞吐。大数据场景几乎都是**写密集型**（日志采集、IoT 上报、CDC 同步、时序监控），这个 trade-off 是值得的。
 
-| 指标 | B+Tree (InnoDB) | LSM-Tree (RocksDB) |
-|------|----------------|-------------------|
-| 随机写吞吐 | ~5,000 TPS | ~50,000+ TPS |
-| 顺序写吞吐 | ~20,000 TPS | ~200,000+ TPS |
-| 点查延迟 | O(log N) 稳定 | O(L) L=层数，有波动 |
-| 范围查询 | 快（B+Tree 叶节点有序链表） | 需合并多层（较慢） |
-| 写放大 | 1~2x（页写入） | 10~30x（多层 Compaction） |
-| 空间利用率 | ~50-70%（页分裂碎片） | ~80-95%（Compaction 后紧凑） |
+### 1.5 使用 LSM-Tree 的主流组件一览
 
-**结论**：LSM-Tree 用 10~30 倍写放大，换来 10 倍以上的写入吞吐。在写密集型场景（日志、IoT、CDC、时序数据），这个 trade-off 是值得的。
+> 详细实现对比见第二篇：[lsm-tree-implementations-comparison.md](./lsm-tree-implementations-comparison.md)
 
-### 0.7 两种 Compaction 策略
-
-#### Leveled Compaction（以读优先）
-
-```
-L0: [sst_1] [sst_2] [sst_3]     ← key 范围可重叠
-L1: [sst_a] [sst_b] [sst_c]     ← 同层 key 范围不重叠！
-L2: [sst_x] [sst_y] [sst_z]     ← 同层 key 范围不重叠！
-
-Compaction 规则:
-  L0 的 sst_1 与 L1 所有 key 范围重叠的文件合并
-  → 可能要重写 L1 的多个文件
-  → 写放大高 (一个 L0 文件可能触发重写整层 L1)
-
-读取优势:
-  L1/L2 每层只需查1个文件 (key 不重叠，二分定位)
-  → 读放大低
-```
-
-#### Tiered Compaction（以写优先）
-
-```
-L0: [run_1] [run_2] [run_3]     ← 每层允许多个 sorted run
-L1: [run_4] [run_5]             ← key 范围可重叠！
-L2: [run_6]
-
-Compaction 规则:
-  同层积累 T 个 run 后，合并为1个 run 推到下层
-  → 每个 run 只被写一次
-  → 写放大低
-
-读取劣势:
-  每层多个 run，key 范围重叠
-  → 每层都可能要查多个 run
-  → 读放大高
-```
-
-#### 不可能三角
-
-```
-        写放大 低
-           /\
-          /  \
-         /    \
-        / 不可能 \
-       /  三角    \
-      /____________\
-  读放大 低      空间放大 低
-
-Leveled:  读低 + 空间低 → 写高
-Tiered:   写低           → 读高 + 空间高
-Universal: 动态平衡，在三角内找最优点
-```
-
-**这就是为什么后续所有系统（HBase/Iceberg/Paimon/Doris）都在这个三角内做优化，而不是消除放大——放大是 LSM-Tree 换取写入性能的本质代价。**
+| 类别 | 组件 | LSM 来源 |
+|------|------|---------|
+| 参考实现 | LevelDB, RocksDB | 原创 / LevelDB 演进 |
+| NoSQL | HBase, Cassandra, ScyllaDB | 自研 |
+| NewSQL | TiKV, OceanBase, CockroachDB/Pebble | RocksDB定制 / 自研 / Go自研 |
+| OLAP | Doris, StarRocks | 自研列式 LSM |
+| 数据湖 | **Paimon** (唯一内置 LSM 的湖格式) | 自研 |
+| 流引擎 State | Flink (RocksDB StateBackend) | RocksDB |
+| 专用引擎 | BadgerDB, X-Engine, TerarkDB | WiscKey / 自研 / RocksDB fork |
 
 ---
 
-## 一、用具体例子讲清三种放大
+## 二、LSM-Tree 底层原理
 
-### 1.1 写放大 — 改1行，磁盘写了100行
-
-**场景**：用户表 1 亿行，按 user_id 分区，每个 Parquet 文件 128MB。
-
-```sql
-UPDATE user_table SET phone='13900001111' WHERE user_id = 12345;
-```
-
-**Iceberg COW 模式下**：
+### 2.1 核心结构
 
 ```
-原始文件: user_part_001.parquet (128MB, 100万行)
-                 ↓
-找到 user_id=12345 所在文件
-                 ↓
-读取整个 128MB → 改1行 → 写出新 128MB
-                 ↓
-实际写入: 128MB / 有效变更: ~100B
-写放大 ≈ 100万倍
+Write Path:
+  Client → WAL (磁盘, 追加写, 用于崩溃恢复)
+         → MemTable (内存, SkipList/红黑树, 有序)
+                ↓ 满了 (如 64MB)
+           Flush → L0 SSTable (Sorted String Table, 不可变有序文件)
+                        ↓ L0 文件太多
+                   Compaction → L1 → L2 → ... → Ln
+
+Read Path:
+  Client → MemTable → L0 → L1 → L2 → ... → Ln
+           (逐层查找, 找到最新版本即停)
 ```
 
-**Paimon LSM 模式下**：
+### 2.2 完整写入流程
 
 ```
-写入 (user_id=12345, phone='13900001111') → MemTable (内存)
-                 ↓ (攒够 buffer 或 Checkpoint 触发)
-Flush → L0 新 SST 文件 (~KB级)
-                 ↓ (后台 Compaction)
-L0 + L1 合并 → 新 L1 文件
-                 ↓
-实际写入: 数KB (Flush) + Compaction 再写一次
-写放大 ≈ 2~10倍
+Step 1: WAL + MemTable
+  ┌──────────────────────┐
+  │  MemTable (sorted)   │  ← 纯内存操作, 红黑树或跳表
+  │  key=A → v3          │
+  │  key=B → v1          │
+  │  key=C → v2          │
+  └──────────┬───────────┘
+             │ 满了
+             ↓
+Step 2: Flush → SSTable
+  ┌──────────────────────┐
+  │  L0/sst_001          │  ← 一次顺序写
+  │  [A:v3, B:v1, C:v2]  │
+  └──────────────────────┘
+  ┌──────────────────────┐
+  │  L0/sst_002          │  ← 又一次 Flush
+  │  [A:v5, D:v1, E:v1]  │     A 出现了两次 (v3 和 v5)
+  └──────────────────────┘
+             │ L0 文件太多
+             ↓
+Step 3: Compaction
+  读取 sst_001 + sst_002
+  → 合并排序 → A 取最新 v5
+  → 写出新文件 sst_003 到 L1
+  → 删除旧文件
+
+  同样的数据被写了两次 → 这就是写放大的来源
 ```
 
-**HBase 高频更新同一行**：
+### 2.3 两大经典 Compaction 策略
+
+#### Leveled Compaction（读优先）
+
+```
+L0: [sst_1] [sst_2] [sst_3]     ← key 范围可重叠
+L1: [sst_a] [sst_b] [sst_c]     ← 同层 key 不重叠！
+L2: [sst_x] [sst_y] [sst_z]     ← 同层 key 不重叠！
+
+Compaction: L0 文件与 L1 所有重叠文件合并 → 可能重写 L1 多个文件
+→ 写放大高, 读放大低
+代表: LevelDB, RocksDB 默认, Pebble, HBase Minor
+```
+
+#### Tiered Compaction（写优先）
+
+```
+L0: [run_1] [run_2] [run_3]     ← 同层允许多个 sorted run
+L1: [run_4] [run_5]             ← key 范围可重叠！
+
+Compaction: 同层积累 T 个 run 后合并为 1 个推到下层 → 每个 run 只被写一次
+→ 写放大低, 读放大高
+代表: Cassandra STCS, ScyllaDB STCS
+```
+
+#### 第三条路：Universal Compaction（动态平衡）
+
+```
+不强制每层不重叠 (Leveled 太激进)
+也不放任全部重叠 (Tiered 太懒)
+动态评估: "合并这几个 sorted run 的收益 > 成本？" → 选择性合并
+
+代表: RocksDB Universal, Paimon Universal
+```
+
+---
+
+## 三、LSM-Tree 的代价：三种放大问题
+
+放大不是 LSM-Tree 的缺陷，而是用顺序写换取高吞吐的**必然代价**。但如何最小化这个代价，是过去 20 年所有 LSM 组件努力的方向。
+
+### 3.1 写放大 (Write Amplification)
+
+**定义**：一条数据从写入到最终稳定，实际磁盘写入量 / 用户原始写入量。
+
+**根因**：Compaction 反复读出旧数据、合并、写出新文件。
+
+```
+用户写入 1 条 → MemTable → Flush L0 (写1次)
+                              → Compaction L0→L1 (写第2次)
+                              → Compaction L1→L2 (写第3次)
+                              → ...
+
+Leveled: 写放大 ≈ T × L (T=层间大小比, L=层数), 典型 10~30x
+Tiered:  写放大 ≈ L, 典型 2~7x
+```
+
+**具体例子 — HBase 高频更新同一行**：
 
 ```java
-// 10000次更新同一个 rowkey
 for (int i = 0; i < 10000; i++) {
     Put put = new Put(Bytes.toBytes("row_001"));
     put.addColumn(CF, COL, Bytes.toBytes("value_" + i));
     table.put(put);
 }
 // 10000次写入 → MemStore → 多次 Flush → 多个 HFile
-// Major Compaction 把所有 HFile 合并，只保留最新1条
+// Major Compaction 全部合并, 只保留最新1条
 // 磁盘实际写: 10000次 Flush + N次 Compaction 重写
 // 有效数据: 1行
 ```
 
-### 1.2 读放大 — 查1行，磁盘读了20个文件
+### 3.2 读放大 (Read Amplification)
 
-**场景**：Paimon 主键表，持续流写入，Compaction 没跟上。
+**定义**：读取一条记录时，实际磁盘读取量 / 该记录数据量。
 
-```sql
-SELECT * FROM orders WHERE order_id = 'ORD_20260228_001';
-```
-
-**未及时 Compaction**：
+**根因**：数据分散在多层多个文件中，查询需逐层查找。
 
 ```
-L0: sst_100 ~ sst_80  (20个文件, key 范围全部重叠!)
-L1: sst_50 ~ sst_79   (30个文件)
-L2: sst_01 ~ sst_49   (49个文件)
+Compaction 没跟上时:
+  L0: 20个文件 (key 范围全部重叠!)
+  L1: 30个文件
+  L2: 49个文件
 
-查 order_id = 'ORD_20260228_001':
-  → L0 的20个文件 key 范围重叠，每个都可能包含该 key
-  → 逐个打开，读 Bloom Filter 判断
-  → 然后 L1 找1个，L2 找1个
-  → 为了1行数据，打开了 20+ 个文件
+  查 1 条: → L0 的 20 个文件逐个打开 → Bloom Filter 判断 → L1 查 1 个 → L2 查 1 个
+  为了 1 行数据, 打开 20+ 个文件
 
-读放大 ≈ 20x ~ 50x
+Compaction 充分时:
+  L0: 空
+  L1: 10个 (key 不重叠)
+
+  查 1 条: → 二分定位 1 个文件 → Bloom Filter → Data Block → 返回
 ```
 
-**Compaction 充分时**：
+### 3.3 空间放大 (Space Amplification)
+
+**定义**：磁盘实际占用 / 有效数据量。
+
+**根因**：旧版本和 tombstone 在 Compaction 前一直占用空间。
 
 ```
-L0: (空)
-L1: sst_01 ~ sst_10 (key 不重叠，有序)
+同一 key 更新 5 次 (Tiered Compaction):
+  Run 1: (key=A, v1)  ← 旧
+  Run 5: (key=A, v5)  ← 唯一有效
+  有效 1 份, 实际存储 5 份 → 空间放大 5x
 
-查 order_id:
-  → 二分定位到 sst_05 → Bloom Filter → Data Block → 返回
-  → 只打开1个文件
-
-读放大 ≈ 1x
+DELETE 不是真删除:
+  写入 tombstone 标记 → 原始数据仍在 → 等 Compaction 清理
 ```
 
-### 1.3 空间放大 — 存1份数据，磁盘占了3份
-
-**场景**：频繁 DELETE 但不做 Compaction。
-
-```sql
-DELETE FROM orders WHERE create_time < '2026-01-28';
-```
-
-**LSM-Tree 中 DELETE 不是真删除**：
+### 3.4 不可能三角
 
 ```
-原始数据:  L2 中 1000万条订单 (500MB)
-执行DELETE: 写入 tombstone 到 L0 (几KB)
+        写放大 低
+           /\
+          /  \
+         / 不可能 \
+        /  三角    \
+       /____________\
+  读放大 低      空间放大 低
 
-磁盘状态:
-  L0: tombstone "删除 create_time < 2026-01-28"
-  L2: 原始1000万条仍完整存在
-
-有效数据: 700万条 (~350MB)
-磁盘占用: 500MB + tombstone
-空间放大 = 500MB / 350MB ≈ 1.43x
+Leveled:   读低 + 空间低 → 写高
+Tiered:    写低           → 读高 + 空间高
+Universal: 在三角内动态找最优点
 ```
 
-**Tiered Compaction 多版本极端情况**：
-
-```
-同一 key 更新5次，每次在不同 sorted run:
-
-Run 1: (key=A, v1)  ← 最旧
-Run 2: (key=A, v2)
-Run 3: (key=A, v3)
-Run 4: (key=A, v4)
-Run 5: (key=A, v5)  ← 唯一有效
-
-有效: 1份，实际存储: 5份
-空间放大 = 5x
-```
+**这就是为什么所有 LSM 组件都在这个三角内做优化，而不是消除放大——放大是高吞吐写入的本质代价。**
 
 ---
 
-## 二、LSM-Tree 底层原理
+## 四、解决放大的手段体系
 
-### 核心结构
+以 LSM-Tree 的三个问题为主线，梳理各类解决方案。
 
-```
-Write Path:
-  Client → MemTable (内存) → Flush → L0 SSTable → Compaction → L1 → L2 → ... → Ln
+### 4.1 降低写放大
 
-Read Path:
-  Client → MemTable → L0 → L1 → L2 → ... → Ln (逐层查找，合并结果)
-```
+| 手段 | 原理 | 代表组件 |
+|------|------|---------|
+| **Universal Compaction** | 选择性合并，只在收益>成本时触发 | RocksDB, Paimon |
+| **UCS 统一策略** | 单参数 W 连续调节写/读平衡 | Cassandra 5.0 |
+| **KV 分离** | 大 Value 存独立文件，Compaction 只移动 Key+指针 | BadgerDB(WiscKey), TiKV(Titan), Pebble(ValueSep) |
+| **Macro Block 增量合并** | 只重写脏块，干净块引用复用 | OceanBase (2MB Macro Block) |
+| **异步 Compaction** | 写入与合并隔离到独立资源池 | Paimon(独立Flink Job), OceanBase(轮转合并) |
+| **In-Memory Compaction** | MemTable 内先合并再 Flush → Flush 次数减少 | HBase 2.0+ |
+| **MOB** | 大 Value 不参与 Compaction | HBase 2.0+ |
+| **FPGA 加速** | Compaction 执行卸载到硬件 | X-Engine |
+| **Lookup Compaction** | 只合并有 key 冲突的文件，无交集则跳过 | Paimon |
+| **Flink 预 Shuffle + 攒批** | 数据写入前按 Bucket Key 分发+攒批 → 源头减少合并量 | Flink + Paimon |
+| **SST Compaction Guard** | SST 边界对齐 Region 边界 → 避免跨 Region 重写 | TiKV |
 
-设计哲学：**用顺序写替代随机写**。写入先进内存（MemTable），满后刷盘为有序文件（SSTable），通过后台 Compaction 合并。
+### 4.2 降低读放大
 
-### 写放大根因：Compaction
+| 手段 | 原理 | 代表组件 |
+|------|------|---------|
+| **Bloom Filter** | 快速判断 key 不在某文件，跳过无效 IO | 所有 LSM 组件 |
+| **Merge-on-Write (MoW)** | 写入时即去重，查询无需合并多版本 | Doris 2.1+, StarRocks, Paimon MOW |
+| **Deletion Vector** | Bitmap 标记已删行，读时直接跳过 | Paimon 0.8+, Doris |
+| **L0 Sublevel** | L0 内分虚拟子层，支持并发 Compaction | Pebble (CockroachDB) |
+| **分区/分桶裁剪** | 缩小查询扫描范围 | 所有 LSM 组件 |
+| **Zone Map (min/max 统计)** | 列级别统计，跳过无关数据块 | Doris, StarRocks |
+| **HyperClockCache** | 无锁并发缓存，高负载下延迟更稳定 | RocksDB 10.2+ |
+| **CO-Index** | 在压缩数据上直接搜索，无需解压 | TerarkDB |
 
-假设 size ratio = T（每层容量是上一层的 T 倍），层数 = L：
-- **Leveled Compaction**：写放大 ≈ T × L（每次 compaction 可能重写整层）
-- **Tiered Compaction**：写放大 ≈ L（每层只追加，不重写同层）
+### 4.3 降低空间放大
 
-### 读放大根因：数据分散
-
-- **Leveled Compaction**：读放大 ≈ L（每层最多查1个文件，同层 key 不重叠）
-- **Tiered Compaction**：读放大 ≈ T × L（每层有 T 个 sorted run，key 重叠）
-
-### 核心矛盾：跷跷板
-
-| 策略 | 写放大 | 读放大 | 空间放大 |
-|------|--------|--------|----------|
-| Leveled Compaction | 高 (T×L) | 低 (L) | 低 |
-| Tiered Compaction | 低 (L) | 高 (T×L) | 高 |
-| FIFO (无 Compaction) | 最低 (1) | 最高 | 最高 |
-
-**本质**：Compaction 做得越勤 → 数据越有序 → 读越快 → 但写放大越大。不可能三角。
-
-### 通用优化手段
-
-| 手段 | 优化目标 | 原理 |
-|------|---------|------|
-| Bloom Filter | 读放大 | 快速判断 key 不在某文件，跳过无效 IO |
-| 分区/分桶 | 读+写 | 缩小 Compaction 和查询范围 |
-| Tiered + Leveled 混合 | 平衡 | 上层 Tiered 减少写，下层 Leveled 减少读 |
-| Compaction 调度优化 | 写放大 | 选择性 Compaction，避免不必要重写 |
-| Z-order / Hilbert 排序 | 读放大 | 多维数据局部性更好，减少扫描文件数 |
+| 手段 | 原理 | 代表组件 |
+|------|------|---------|
+| **及时 Compaction** | 合并清理旧版本和 tombstone | 所有 LSM 组件 |
+| **ICS 增量策略** | SSTable 分段，Major Compaction 空间开销从 50% 降到 5% | ScyllaDB |
+| **渐进合并** | DDL 变更后分 N 次逐步重写 | OceanBase |
+| **ZSTD 压缩** | 高压缩比列式存储 | X-Engine (1/3~1/10), OceanBase |
+| **MVCC GC Filter** | Compaction 底层自动清理旧 MVCC 版本 | TiKV |
+| **Periodic Full Compaction** | 空闲时全量合并清除冗余 | TiKV v7.6+ |
 
 ---
 
-## 三、技术演进链 — 站在巨人肩膀上
+## 五、各组件的 LSM-Tree 具体实践
 
-### 3.1 HBase 时代 — 发现问题
+### 5.1 HBase — 第一个大规模暴露 LSM 问题的系统
 
-HBase 是第一代大规模 LSM-Tree 系统，**暴露了所有经典问题**。
-
-#### HBase 的核心痛点
+**版本**: 2.6.4
 
 ```
-痛点1: Major Compaction 风暴
-  → 定时触发，读写整个 Region 的全部 HFile
-  → 凌晨跑时 CPU/IO 打满，影响在线服务
-
-痛点2: 读放大严重
-  → 一个 Region 5-10 个 HFile 很正常
-  → 每次 Get 查所有 HFile
-  → BlockCache 未命中时延迟飙升
-
-痛点3: 空间放大 (HDFS 3副本)
-  → 数据 → MemStore → HFile(1份) → HDFS(×3) = 3份
-  → Compaction 期间新旧共存 → 短时间6份
+架构:
+  Client → RegionServer → MemStore (per Column Family)
+                                ↓ Flush
+                           HFile (SSTable on HDFS)
+                                ↓ Compaction
+                           合并后的 HFile
 ```
 
-#### HBase 的优化（不换系统）
+#### HBase 暴露的问题
 
-**(1) 版本特性演进**：
+```
+问题1: Major Compaction 风暴
+  定时触发, 读写整个 Region 全部 HFile → CPU/IO 打满, 影响在线服务
+
+问题2: 读放大
+  一个 Region 5-10 个 HFile 很正常 → 每次 Get 查所有 HFile
+
+问题3: 空间放大
+  HDFS 3 副本 → 数据写 1 份, 存 3 份 → Compaction 期间新旧共存 → 短时间 6 份
+```
+
+#### HBase 怎么解决
+
+**(1) 版本特性**:
 
 | 版本 | 特性 | 解决什么 |
 |-----|------|---------|
-| 0.98 | Stripe Compaction | Region 分多个 stripe，Compaction 范围缩小 → 写放大降低 50%+ |
-| 1.0 | Date-tiered Compaction | 时序数据按时间分层，旧数据不反复合并 → 写放大降低 |
-| 2.0 | In-memory Compaction | MemStore 内部先合并再 Flush → Flush 次数减少 → 写放大降低 |
-| 2.0 | MOB (Medium Object) | >100KB value 单独存储不参与 Compaction → 写放大大幅降低 |
-| 2.0 | BucketCache (off-heap) | 堆外缓存，增大容量减少 GC → 读放大降低 |
+| 0.98 | Stripe Compaction | Region 分条带，缩小 Compaction 范围 → 写放大 -50% |
+| 1.0 | Date-tiered Compaction | 时序数据旧数据不反复合并 → 写放大降低 |
+| 2.0 | In-memory Compaction | MemStore 内先合并再 Flush → 写放大降低 |
+| 2.0 | MOB | >100KB value 独立存储不参与 Compaction → 写放大大幅降低 |
+| 2.0 | BucketCache (off-heap) | 堆外缓存 → 读放大降低 |
 
-**(2) 配置调优**：
+**(2) 配置调优**:
 
 ```xml
 <!-- 减少写放大: 提高 Flush 阈值 -->
@@ -413,551 +392,257 @@ HBase 是第一代大规模 LSM-Tree 系统，**暴露了所有经典问题**。
   <value>604800000</value>  <!-- 7天, 默认1天 -->
 </property>
 
-<!-- 减少读放大: 启用 Bloom Filter -->
+<!-- 减少读放大: Bloom Filter -->
 <property>
   <name>hbase.bloomfilter.type</name>
   <value>ROW</value>
 </property>
 
-<!-- 减少读放大: 控制 HFile 上限 -->
+<!-- 减少读放大: HFile 数量上限 -->
 <property>
   <name>hbase.hstore.compactionThreshold</name>
-  <value>3</value>  <!-- 3个HFile触发Minor Compaction -->
+  <value>3</value>
 </property>
 ```
 
-**(3) 任务调整**：
+**(3) 任务调整**:
 
 ```bash
-# 关闭自动 Major Compaction，改为手动调度到业务低峰
+# 关闭自动 Major Compaction, 手动调度到低峰
 hbase.hregion.majorcompaction = 0
-
-# 凌晨3点手动触发
 0 3 * * * /usr/bin/hbase major_compact 'table_name'
 ```
 
-**(4) 业务/数据调整**：
+**(4) 业务调整**:
 
 ```
-问题: 热点 rowkey 导致单 Region 写集中 → Compaction 压力大
-
-反例 (热点):
-  rowkey = "20260228_order_001"  → 同一天全在一个 Region
-
-正例 (打散):
-  rowkey = MD5("20260228_order_001")[0:4] + "_20260228_order_001"
-  → 分散到多个 Region，每个 Compaction 压力降低
+问题: 热点 rowkey → 单 Region 写集中 → Compaction 压力大
+解决: rowkey 加盐分散
+  反例: "20260228_order_001"         → 同天全在一个 Region
+  正例: MD5(key)[0:4] + "_" + key   → 分散到多个 Region
 ```
 
-#### HBase 解决不了的根本问题
+#### HBase 无法解决的根本问题
 
-```
-❌ 只支持 KV 点查和短 Scan，不支持复杂 SQL 分析
-❌ HDFS 3副本是硬性要求，空间放大不低于 3x
-❌ Compaction 和在线服务共享资源，无法真正隔离
-❌ Schema 固定（列族），不适合灵活分析
-```
-
-→ 催生了数据湖表格式的出现
+- 只支持 KV 点查, 不支持 SQL 分析
+- HDFS 3 副本, 空间放大下限 3x
+- Compaction 与在线服务共享资源
+- Schema 固定 (列族)
 
 ---
 
-### 3.2 Iceberg 时代 — 换思路，文件级版本管理
+### 5.2 Cassandra / ScyllaDB — 分布式 LSM 的 Compaction 进化
 
-Iceberg 看到 HBase 问题后换了思路：不在文件内部做 LSM 合并，而是在文件级别做版本管理。
+#### Cassandra 5.0: UCS 统一策略
 
-#### Iceberg 解决了 HBase 的什么
+**版本**: 5.0.6
 
-```
-✅ SQL 分析能力 (Parquet/ORC + Spark/Flink/Trino)
-✅ 不强制 HDFS 3副本 (可用对象存储)
-✅ Schema Evolution (加减列不影响已有数据)
-✅ Time Travel (快照隔离)
-✅ 分区演进 (不重写数据就能改分区)
-```
-
-#### Iceberg 自身的放大问题
-
-**COW 写放大**：
-
-```python
-# Spark + Iceberg COW
-spark.sql("""
-    MERGE INTO orders t
-    USING updates s ON t.order_id = s.order_id
-    WHEN MATCHED THEN UPDATE SET t.status = s.status
-""")
-
-# updates 100条，分布在50个 Parquet 文件中
-# → 50个文件每个: 读全部 → 改几行 → 写出新文件
-# → 50 × 128MB = 6.4GB IO，有效变更 ~10KB
-# 写放大 ≈ 65万倍
-```
-
-**MOR 读放大**：
-
-```python
-# Iceberg MOR (v2 position delete)
-# 100次小批量更新后:
-#   data files: 50个
-#   delete files: 100个
-
-# 查询时:
-#   读 data file → 读所有关联 delete files → 逐行判断删除 → 合并
-#   delete files 越多 → 读放大越严重
-```
-
-**流式小文件 = 空间 + 读放大**：
+Cassandra 过去有 STCS (写优)、LCS (读优)、TWCS (时序) 三种策略，切换需要全量 Compaction。5.0 引入 **UCS (Unified Compaction Strategy)**，用一个参数 W 连续调节：
 
 ```
-Flink → Iceberg, 每分钟 Checkpoint
-  → 每分钟1个小文件 → 一天1440个
-  → 小文件: Parquet 压缩效率低 → 空间放大
-  → 文件多: 查询扫描1440个元数据 → 读放大
+W < 0 → Leveled 行为 (高写放大, 低读放大)
+W = 0 → 平衡点
+W > 0 → Tiered 行为 (低写放大, 高读放大)
+
+不同层可设不同 W → 如 L0 用 Tiered, 深层用 Leveled
+参数热切换, 无需全量 Compaction
 ```
 
-#### Iceberg 的优化
+#### ScyllaDB: ICS 增量策略
 
-**(1) 版本特性**：
+**版本**: 2025.4.3
 
-| 版本 | 特性 | 解决什么 |
-|-----|------|---------|
-| v2 (0.13+) | Position Delete (替代 Equality Delete) | 记行号而非全 key → 写放大降低 |
-| 1.3+ | Object Storage Layout | 文件路径优化 → 读放大降低 |
-| 1.4+ | MOR 优化 | delete file 与 data file 关联更高效 → 读放大降低 |
+ScyllaDB (C++ 重写 Cassandra) 独创 **ICS (Incremental Compaction Strategy)**:
+- 大 SSTable 拆为 1GB 的 Run 段
+- Major Compaction 空间开销从 **50% 降到 5%**
+- 支持跨层 tombstone 清理
 
-**(2) 配置调优**：
-
-```sql
-ALTER TABLE orders SET TBLPROPERTIES (
-    'write.target-file-size-bytes' = '134217728',   -- 128MB 目标
-    'write.distribution-mode' = 'hash',              -- 写前 hash 分发
-    'commit.manifest.min-count-to-merge' = '10',     -- 10个 manifest 再合并
-    'read.split.target-size' = '268435456'           -- 读 split 256MB
-);
-```
-
-**(3) 任务调整 — 定期 Compaction**：
-
-```python
-# 合并小文件
-spark.sql("""
-    CALL catalog.system.rewrite_data_files(
-        table => 'db.orders',
-        strategy => 'sort',
-        sort_order => 'order_id',
-        options => map(
-            'target-file-size-bytes', '134217728',
-            'min-file-size-bytes', '67108864'
-        )
-    )
-""")
-
-# 合并 delete files (减少读放大)
-spark.sql("""
-    CALL catalog.system.rewrite_data_files(
-        table => 'db.orders',
-        options => map('delete-file-threshold', '3')
-    )
-""")
-
-# 清理过期快照 (减少空间放大)
-spark.sql("""
-    CALL catalog.system.expire_snapshots(
-        table => 'db.orders',
-        older_than => TIMESTAMP '2026-02-21 00:00:00',
-        retain_last => 5
-    )
-""")
-```
-
-**(4) 业务/数据调整**：
-
-```
-问题: 更新分散在大量文件中 → COW 写放大巨大
-
-反例: 按 region 分区
-  PARTITIONED BY (region)
-  → 更新分散在所有 region → 每个分区文件都要重写
-
-正例: 按日期分区
-  PARTITIONED BY (days(create_time))
-  → 更新集中在最近几天 → 只重写少量分区
-  → 历史分区完全不受影响
-```
-
-#### Iceberg 解决不了的根本问题
-
-```
-❌ COW 写放大本质无法避免 (改1行必须重写整文件)
-❌ MOR delete file 积累后读放大严重，依赖手动 Compaction
-❌ 没有内置 LSM-Tree，更新密集场景效率远不如 KV 存储
-❌ Compaction 依赖外部引擎调度，不是存储层自治
-❌ 无原生 Changelog，CDC 场景需额外处理
-```
-
-→ 催生了 Paimon：把 LSM-Tree 嵌入数据湖表格式
+Shard-per-core 架构: 每个 CPU 核心独立内存/存储/网络, 消除线程竞争, Compaction 也是 per-shard 执行。
 
 ---
 
-### 3.3 Spark → Flink — 计算引擎的演进
+### 5.3 TiKV — RocksDB 深度定制 + Titan KV 分离
 
-在讲 Paimon 之前，先理清计算引擎的演进。
+**版本**: v8.5.5 LTS
 
-#### Spark 时代的问题
+TiKV 运行两个 RocksDB 实例 (`raftdb` + `kvdb`)，在 RocksDB 之上做了三大定制：
 
-```
-Spark Structured Streaming = 微批 (Micro-batch)
-  → 每个微批是一个独立的批处理 Job
-  → 每个 Job 有启动开销 (调度、资源申请)
-  → 最小延迟 ~100ms，实际常在秒级
+| 优化 | 原理 | 效果 |
+|------|------|------|
+| **SST Compaction Guard** | SST 边界对齐 Region 边界 | 写放大显著降低 |
+| **Flow Control** | 替换 Write Stall 为分层限流 | 写入吞吐更平滑 |
+| **MVCC GC Filter** | Compaction 底层自动清理旧版本 | 空间放大降低 |
 
-对数据湖写入的影响:
-  → 每个微批产生独立的文件提交
-  → 微批间隔越短 → 小文件越多 → 写放大、读放大
-  → Spark 无法感知上下游 Changelog 语义 (+I/-U/+U/-D)
-  → 所有更新都当"全量行"处理 → 存储层做更多无谓合并
-```
-
-#### Flink 解决了什么
+**Titan KV 分离 (v7.6+ 默认启用)**:
 
 ```
-✅ 真正的流处理 (事件驱动，非微批)
-  → 数据到达即处理，延迟 ms 级
-  → 写入更均匀，不会产生"批次性"小文件堆积
-
-✅ 原生 Changelog 语义
-  → Flink CDC 产生标准 Changelog (+I, -U, +U, -D)
-  → 存储层可直接根据类型做增量合并
-  → 不需要 full-row 对比 → 减少合并计算量
-
-✅ Checkpoint 与 Snapshot 对齐
-  → Flink Checkpoint = Paimon 原子提交
-  → 没有额外 commit 开销
-  → 间隔可控 (旋钮: 间隔短=实时性高+小文件多, 间隔长=反之)
-
-✅ 常驻 Streaming Compaction
-  → Spark: 合并小文件要启动新 Spark Job
-  → Flink: 常驻 Streaming Job 持续做 Compaction
+Value >= 32KB → 分离到 Blob File, LSM 只存指针
+Compaction 只移动 Key + 指针 (几十字节), 不移动大 Value
+→ Value=1KB: QPS 提升 2x
+→ Value=32KB: QPS 提升 6x
+→ 代价: 磁盘空间增大, 大范围 Scan 变慢
 ```
 
 ---
 
-### 3.4 Paimon + Flink — 把 LSM 带回数据湖，但比 HBase 更聪明
+### 5.4 OceanBase — 自研 LSM, Macro Block 增量合并
 
-#### Paimon 从前辈学到了什么
+**版本**: V4.3.5 / V4.2.5
 
-```
-从 HBase:
-  ✅ LSM-Tree 写入效率高 (顺序写 + 后台合并)
-  ✅ Bloom Filter, 分层存储
-  ❌ 不再绑定 HDFS 3副本
-  ❌ 不再 KV 接口，而是 SQL 表
-
-从 Iceberg:
-  ✅ 列式存储 (ORC/Parquet) 做分析
-  ✅ 快照隔离, Schema Evolution
-  ✅ 分区裁剪
-  ❌ 不再用 COW (改为 LSM append)
-  ❌ 内置 Compaction (不完全依赖外部调度)
-
-Paimon = LSM-Tree 引擎 + 数据湖表格式 + 列式存储
-```
-
-#### Paimon 和 Flink 到底各自做了什么 — 分层解决同一目标
-
-**核心问题：他们说的是同一件事，还是各自解决了不同层的问题？**
-
-**答案：不同层的问题，同一个最终目标。**
+OceanBase 的 LSM-Tree 与 RocksDB 系有根本差异：
 
 ```
-写放大的总量 = 计算层浪费 + 存储层 Compaction 开销
+RocksDB: Compaction 单位 = 整个 SSTable (数十~数百 MB)
+OceanBase: Compaction 单位 = 2MB Macro Block
+  → 只重写被修改的 Macro Block, 未修改的直接引用复用
+  → 写放大远低于 RocksDB
+```
 
-┌─────────────┬──────────────────────────────────────────────┐
-│ Flink 解决  │ 计算层浪费:                                   │
-│ (数据入口)  │  - 预 Shuffle → 减少跨 Bucket 写入            │
-│             │  - 攒批 → 减少小文件                          │
-│             │  - Changelog 语义 → 减少合并计算量             │
-│             │                                              │
-│             │ 效果: 让存储层收到的数据"更干净"               │
-│             │       从源头减少 Compaction 工作量              │
-├─────────────┼──────────────────────────────────────────────┤
-│ Paimon 解决 │ 存储层 Compaction 开销:                       │
-│ (数据存储)  │  - Universal Compaction → 选择性合并           │
-│             │  - Lookup Compaction → 跳过无冲突数据          │
-│             │  - Deletion Vector → 消除 MOR 读放大           │
-│             │  - 异步 Compaction → 写入零等待                │
-│             │                                              │
-│             │ 效果: 即使同样的数据，Compaction 开销也更小     │
-└─────────────┴──────────────────────────────────────────────┘
+**三级 Compaction**: Mini SSTable → Minor SSTable → Major SSTable (每日低峰)
 
-Flink = 减少问题的输入 (让数据更有序更干净)
-Paimon = 优化问题的处理 (让 Compaction 更聪明)
+**轮转合并**: 利用多副本架构, Compaction 期间查询路由到其他副本 → **彻底隔离 Compaction 对在线查询的影响**。这是单机 LSM (RocksDB/HBase) 做不到的。
+
+---
+
+### 5.5 CockroachDB / Pebble — Go 原生 LSM + Value Separation
+
+**版本**: v26.1.0
+
+Pebble 是 Go 重写的 LSM 引擎, 核心创新:
+
+- **L0 Sublevel**: L0 分虚拟子层, 支持并发 Compaction → 减少写入堆积
+- **Value Separation (v25.4 GA)**: 大 Value 存入独立 Blob File → 宽行写密集场景吞吐提升 **50-60%**
+
+与 TiKV Titan、BadgerDB WiscKey 一脉相承，但 Pebble 是纯 Go 实现, 无 CGO。
+
+---
+
+### 5.6 Doris / StarRocks — OLAP 引擎内置列式 LSM
+
+#### Doris
+
+**版本**: 4.0.3
+
+```
+Doris 1.x (MoR): 查询时合并多 Rowset → 读放大严重
+Doris 2.1+ (MoW): 写入时查主键索引 → Delete Bitmap 标记旧行 → 查询直接读
+  → 查询性能提升 10x
+  → 代价: 写入多一次查找
+```
+
+Compaction: Cumulative (小 Rowset 合并) + Base (合并到基线) + Segment (Rowset 内部)。
+
+#### StarRocks
+
+**版本**: v4.0.6
+
+Primary Key 表 = LSM + MoW, 通过内存主键索引 + **DelVector** (Bitmap) 实现写入时去重。
+
+v4.0 云原生优化: Smarter Compaction 减少 70-90% 云存储 API 调用。
+
+---
+
+### 5.7 Paimon + Flink — 把 LSM 带回数据湖
+
+**版本**: Paimon 1.3.x
+
+Paimon 是**唯一在数据湖表格式层面内置 LSM-Tree** 的系统。
+
+```
+Table → Partition → Bucket → LSM-Tree (每个 Bucket 独立)
+```
+
+#### 三种表模式
+
+| 模式 | 写放大 | 读放大 | 原理 |
+|------|--------|--------|------|
+| **MOR** (默认) | 低 | 高 | 只做 minor compaction, 读时合并 |
+| **COW** | 高 | 无 | 每次写入触发全量合并 |
+| **MOW** | 中 | **极低** | LSM 点查 → Deletion Vector (Bitmap) → 读时过滤 |
+
+#### Flink 和 Paimon 各自解决什么
+
+```
+写放大总量 = 计算层浪费 + 存储层 Compaction
+
+Flink (计算层):
+  - 预 Shuffle 按 Bucket Key 分发 → 减少跨 Bucket 写入
+  - 攒批 (write-buffer-size) → 减少小文件
+  - Changelog 语义 (+I/-U/+U/-D) → 减少合并计算量
+  → 让 Paimon 收到的数据"更干净", 从源头减少 Compaction 工作量
+
+Paimon (存储层):
+  - Universal Compaction → 选择性合并
+  - Lookup Compaction → 跳过无冲突数据
+  - Deletion Vector → 读放大 O(1)
+  - 异步 Compaction (独立 Flink Job) → 写入零等待
+  → 即使同样的数据, Compaction 开销也更小
+
 两者叠加 → 端到端写放大最小化
 ```
 
-#### Flink 在计算层的具体优化
+#### 其他数据湖格式的放大问题
 
-```
-1. 预 Shuffle (按 Bucket Key 分发)
-   Flink write 算子之前，按 bucket-key 做 keyBy
-   → 同一 key 的所有变更落到同一 Bucket
-   → Paimon LSM 不需要跨 Bucket 合并
-   → 没有 Flink 预分发？每个 Bucket 收到任意 key → 合并范围爆炸
+Paimon 之外的三大湖格式 (Iceberg / Delta Lake / Hudi) **不使用 LSM-Tree**，但同样面临放大问题：
 
-2. 攒批写入 (Write Buffer)
-   Flink Paimon Sink 内存中维护 write-buffer-size 缓冲区
-   → 攒够再 Flush，不逐条写文件
-   → 减少小文件 → 减少 Compaction 合并对象数
+| 湖格式 | 架构 | 写放大 | 读放大 | 怎么解决 |
+|--------|------|--------|--------|---------|
+| **Iceberg** | 快照 + COW/MOR | COW: 改1行重写整文件 | MOR: delete file 积累 | V3 Deletion Vector (Bitmap); 手动 rewrite_data_files |
+| **Delta Lake** | COW + Deletion Vector | COW 重写; DV 低 | DV 累积后退化 | OPTIMIZE 物理清理; Liquid Clustering |
+| **Hudi** | Base + Log (类 LSM) | MOR 低; COW 高 | MOR 需合并 Log | LogCompaction (Log 间合并不写 Base); LSM Timeline |
 
-3. Changelog 规范化
-   Flink CDC 产生标准 Changelog (+I, -U, +U, -D)
-   → Paimon 根据类型做增量合并
-   → 不需要 full-row 对比判断插入/更新
-   → 减少合并计算开销 (间接减少写放大)
-
-4. Checkpoint = Snapshot
-   Flink Checkpoint 完成 = Paimon 原子提交 Snapshot
-   → 无额外 commit 开销
-   → Checkpoint 间隔 = Snapshot 间隔 (可调旋钮)
-```
-
-#### Paimon 在存储层的具体优化
-
-```
-1. Universal Compaction (从 RocksDB 借鉴改良)
-   HBase: 只有 Size-tiered 和 Leveled
-   RocksDB: 引入 Universal Compaction
-   Paimon: 基于 RocksDB Universal，针对数据湖改良
-
-   原理: 不强制每层 key 不重叠 (Leveled 约束太强 → 写放大大)
-         也不放任重叠 (Tiered → 读放大大)
-         动态评估: "合并这几个 sorted run 的收益 > 成本？"
-         → 选择性合并
-
-   效果: 写放大比 Leveled 低 50%+，读放大比 Tiered 低
-
-2. Lookup Compaction (Paimon 独创)
-   传统: 合并时读取所有参与的 SST，排序后写出
-   Lookup: 合并时只查找有冲突的 key (通过索引定位)
-   → 新 SST 与旧 SST 无交集 → 跳过，不重写旧 SST
-   → 大幅减少无谓重写
-
-3. Deletion Vector (Paimon 0.8+, 借鉴 Delta Lake 3.0)
-   Iceberg MOR: delete file 积累 → 读时合并所有 delete file → 读放大
-   Paimon DV: Bitmap 标记在 data file 元数据中
-   → 读时直接跳过标记行，不读额外 delete file
-   → 读放大从 O(N个delete file) 降到 O(1)
-   → 直接解决 Iceberg MOR 核心缺陷
-
-4. 异步 Compaction (架构设计 + Flink 执行)
-   HBase: Compaction 和 RegionServer 同进程，争 CPU/IO
-   Iceberg: Compaction 是手动触发的批任务
-   Paimon: Compaction 可以是独立 Flink Streaming Job
-
-   -- 写入 (持续运行)
-   INSERT INTO paimon_table SELECT * FROM kafka_source;
-
-   -- 独立 Compaction (持续运行, 独立资源)
-   CALL sys.compact('db.paimon_table');
-
-   写入不等 Compaction → 写入链路写放大 = 0
-   Compaction 独立资源 → 不影响在线查询
-```
-
-#### Paimon + Flink 的四类优化
-
-**(1) 版本特性**：
-
-| 组件 | 特性 | 解决什么 |
-|-----|------|---------|
-| Paimon 0.4+ | Universal Compaction | 动态平衡读写放大 |
-| Paimon 0.5+ | Lookup Compaction | 跳过无冲突数据 → 写放大降低 |
-| Paimon 0.8+ | Deletion Vector | Bitmap 标记替代 delete file → 读放大 O(1) |
-| Flink 1.16+ | Paimon Connector 深度集成 | 预 Shuffle + 攒批 → 源头减少写放大 |
-
-**(2) 配置调优**：
-
-```sql
--- Paimon 表配置
-CREATE TABLE orders (
-    order_id BIGINT,
-    status STRING,
-    PRIMARY KEY (order_id) NOT ENFORCED
-) WITH (
-    'write-buffer-size' = '256mb',                -- 攒批大小 (越大→flush越少→写放大低)
-    'changelog-producer' = 'lookup',              -- changelog 模式
-    'compaction.max-sorted-run-num' = '5',        -- 最大 sorted run 数 (越小→读放大低→写放大高)
-    'deletion-vectors.enabled' = 'true',          -- 开启 Deletion Vector
-    'num-sorted-run.stop-trigger' = '10'          -- sorted run 超过此值暂停写入等 Compaction
-);
-
--- Flink 侧配置
-SET 'execution.checkpointing.interval' = '2min';  -- Checkpoint 间隔
--- 短 → 小文件多 → 写放大大
--- 长 → 延迟高 → 但写放大小
-```
-
-**(3) 任务/算子调整**：
-
-```sql
--- 独立 Compaction Job (与写入 Job 隔离资源)
--- 写入 Job 并行度 = 数据量决定
--- Compaction Job 并行度 = 磁盘 IO 能力决定
-
--- 写入 Job
-INSERT INTO paimon_table SELECT * FROM source;
-
--- 独立 Compaction Job (另一个 Flink 作业)
-CALL sys.compact('db.paimon_table');
-
--- 或在 Flink SQL 中配置自动触发
-SET 'table.exec.compact.enabled' = 'true';
-```
-
-**(4) 业务/数据调整**：
-
-```sql
--- Bucket Key 选择: 高基数列，让数据均匀分布
--- 反例: 低基数 bucket-key
-WITH ('bucket-key' = 'status')  -- status 只有几个值 → 数据倾斜 → 单 bucket 压力大
-
--- 正例: 高基数 bucket-key
-WITH ('bucket-key' = 'order_id')  -- 均匀分布
-
--- Partial Update: 只写变化列，减少写入量
-WITH ('merge-engine' = 'partial-update')
--- 只传 (pk, changed_column) 而非全部列
--- → 写入量减少 → Compaction 合并量减少 → 写放大降低
-```
+其中 **Hudi 的 MOR 在概念上最接近 LSM** (Base File ≈ 深层 Level, Log File ≈ L0)，但它的 Compaction 粒度和策略远不如 Paimon 精细。
 
 ---
 
-### 3.5 Doris — 另一条路：OLAP 引擎内置 LSM
+### 5.8 专用优化引擎
 
-Doris 是一体化 OLAP，不依赖外部存储和计算引擎。
+#### BadgerDB (Dgraph) — WiscKey KV 分离
 
-#### Doris 从前辈学到了什么
+**版本**: v4.x
 
-```
-从 HBase:
-  ✅ LSM-Tree 分层结构
-  ❌ 面向分析 (列式存储)，不是 KV 点查
+LSM-Tree 只存 Key + Value 指针, 大 Value 存独立 vLog。Compaction 只重写 Key+指针 → **写放大接近 1x**。代价: 随机读 vLog + vLog GC 开销。纯 Go, 无 CGO。
 
-从 Iceberg 的教训:
-  ✅ 不走 COW，内置 Compaction
-  ✅ 分区裁剪、列裁剪
+#### PolarDB X-Engine (阿里巴巴) — FPGA 加速 Compaction
 
-独创:
-  Merge-on-Write (2.0+) → 根本性解决 Unique Key 读放大
-```
+**版本**: PolarDB MySQL 8.0.x
 
-#### Doris 的放大问题与优化
+业界首个 **FPGA 硬件加速 OLTP 存储引擎 Compaction** (FAST '20 论文)。Compaction 拆为可并行的 Extent 对任务, 流式卸载到 FPGA Compaction Unit。相比 32 线程 CPU, 性能提升 ~25%, CPU 占用降低 ~10%。支撑 2018 双 11 49.1 万笔/秒交易。
 
-**(1) 版本特性 — Merge-on-Write（最重要）**：
+#### TerarkDB (字节跳动) — 压缩数据上直接搜索
 
-```
-Doris 1.x (Merge-on-Read):
-  写入 → Rowset 1, 2, ... N (各自可能含同一 key)
-  查询 → 读所有 Rowset → 运行时合并去重 → 返回
-  → 读放大严重
+**版本**: v1.4 (RocksDB fork)
 
-Doris 2.0 (Merge-on-Write):
-  写入 → 先查主键索引是否存在该 key
-       → 存在则标记旧行 delete (Bitmap)
-       → 写新行到新 Rowset
-  查询 → 每个 Rowset 已去重，直接读
-  → 读放大 O(N) → O(1)
-  → 代价: 写入多一次查找
-
-  本质: 把读放大成本转移到写入
-        "写少读多"的分析场景，这是正确的 trade-off
-```
-
-**(2) 配置调优**：
-
-```sql
-CREATE TABLE orders (
-    order_id BIGINT,
-    status VARCHAR(20),
-    amount DECIMAL(10,2)
-)
-UNIQUE KEY(order_id)
-DISTRIBUTED BY HASH(order_id) BUCKETS 16
-PROPERTIES (
-    "enable_unique_key_merge_on_write" = "true",  -- 开启 MOW
-    "compaction_policy" = "time_series",           -- 时序优化
-    "disable_auto_compaction" = "false"
-);
-
--- BE 配置
--- cumulative_compaction_num_singleton_deltas = 5
--- base_compaction_interval_seconds_since_last_operation = 86400
--- compaction_task_num_per_disk = 4
-```
-
-**(3) 任务调整**：
-
-```bash
-# 手动触发 Compaction (业务低峰)
-curl -X POST http://be_host:8040/api/compaction/run?tablet_id=xxx&compact_type=cumulative
-
-# 合理分桶 → 每个桶独立 Compaction
-# 反例: BUCKETS 1 → 全数据一起 Compaction
-# 正例: BUCKETS 16 → 各自独立，范围小
-```
-
-**(4) 业务/数据调整**：
-
-```sql
--- 2.1+ Partial Update: 只写变化列
--- 反例: 全量列写入
-INSERT INTO t VALUES (1, 'new_status', NULL, NULL, NULL, ...);
-
--- 正例: 只写变化列
--- 设置 partial_columns 只传 (pk, changed_col)
--- → 存储层合并量减少 → 写放大降低
-
--- 数据模型选择
--- Duplicate: 无去重 → 写放大最低，但不支持更新
--- Aggregate: 预聚合 → Compaction 时直接聚合，减少数据量
--- Unique + MOW: 去重 → 读放大最低
-```
+CO-Index (Nested Succinct Trie): 在压缩数据上直接搜索, 无需解压。传统 SSTable 查询需解压 Block → 搜索 → 丢弃; TerarkDB 跳过解压步骤。号称 200x+ 性能提升 + 15x+ 存储节省 (特定场景)。
 
 ---
 
-## 四、完整演进总结
-
-### 技术演进链
+## 六、Compaction 策略演进全景
 
 ```
-HBase (2008) → Iceberg (2018) → Doris 2.0 (2023) → Paimon (2023) → Flink+Paimon 深度集成 (2024)
-                Spark (2014) ──────────────────────→ Flink (2019 成熟)
+经典策略:
+  ├─ Leveled ─── LevelDB, RocksDB 默认, Pebble, HBase Minor
+  ├─ Tiered ──── Cassandra STCS, ScyllaDB STCS
+  └─ FIFO ────── RocksDB FIFO
 
-HBase 时代的问题:
-  ├── KV 模型无法 SQL 分析 ──────→ Iceberg: 列式存储 + SQL ✅
-  ├── HDFS 3副本空间放大 ────────→ Iceberg: 对象存储 ✅
-  ├── Major Compaction 风暴 ─────→ Iceberg: 没 LSM 没风暴 ✅  (但引入 COW 写放大 ❌)
-  └── Compaction 与在线抢资源 ───→ Paimon: 异步 Compaction Job ✅
+混合/统一策略:
+  ├─ Universal ── RocksDB → Paimon (数据湖改良)
+  ├─ ICS ──────── ScyllaDB (Tiered+Leveled 混合, 5% 空间开销)
+  └─ UCS ──────── Cassandra 5.0 (单参数 W 连续调节, 热切换)
 
-Iceberg 时代的问题:
-  ├── COW 写放大巨大 ───────────→ Paimon: LSM append 不重写 ✅
-  ├── MOR delete file 读放大 ───→ Paimon: Deletion Vector (Bitmap) ✅
-  ├── Compaction 依赖手动调度 ──→ Paimon: 内置触发 + Flink 异步 Job ✅
-  ├── 无原生 Changelog ────────→ Paimon: 原生 Changelog ✅
-  └── 无原生流写入优化 ────────→ Flink: 预 Shuffle + 攒批 + Changelog ✅
+架构级优化 (超越 Compaction 策略本身):
+  ├─ KV 分离 ──── BadgerDB, TiKV Titan, Pebble ValueSep, RocksDB BlobDB
+  ├─ Macro Block ── OceanBase (块级增量, 只重写脏块)
+  ├─ 异步/轮转 ── OceanBase 轮转, Paimon 独立 Flink Job
+  ├─ FPGA 加速 ── X-Engine
+  ├─ 压缩直接搜索 ── TerarkDB CO-Index
+  ├─ Deletion Vector ── Paimon / Doris / StarRocks
+  └─ MoW 写入时去重 ── Doris / StarRocks / Paimon MOW
 
-Spark 时代的问题:
-  ├── 微批延迟高 ──────────────→ Flink: 真正流处理 ✅
-  ├── 批 Compaction 启动新 Job →  Flink: 常驻 Streaming Compaction ✅
-  └── 无 Changelog 语义 ──────→ Flink CDC: 端到端 Changelog ✅
+趋势:
+  1. 策略统一化: 多策略 → UCS/Universal (一个参数调平衡)
+  2. KV 分离普及: WiscKey → Titan → Pebble → 越来越多内置
+  3. Deletion Vector 标准化: Paimon/Iceberg V3/Delta Lake 共享 Roaring Bitmap
+  4. 计算存储解耦: Compaction 独立资源 (Paimon Flink Job / OceanBase 轮转)
+  5. 硬件加速: FPGA (X-Engine), 持久内存 (Tair AEP)
 ```
-
-### 四种优化手段对照表
-
-| 手段 | HBase | Iceberg | Paimon+Flink | Doris |
-|------|-------|---------|-------------|-------|
-| **版本特性** | In-memory Compaction, MOB, Date-tiered | Position Delete, MOR v2 | Deletion Vector, Lookup Compaction, Universal Compaction | Merge-on-Write, Partial Update |
-| **配置调优** | flush.size, majorcompaction 间隔, bloom filter | target-file-size, distribution-mode | write-buffer-size, compaction.max-sorted-run-num, checkpoint 间隔 | compaction_policy, buckets 数, MOW 开关 |
-| **任务/算子** | 手动 Major Compaction, 预分区 | rewrite_data_files, expire_snapshots | 独立 Compaction Job, Flink 并行度 | 手动 Compaction, 分桶策略 |
-| **业务/数据** | rowkey 加盐/反转, 列族拆分 | 按更新热度分区, Sort Order | Bucket Key 选高基数列, Partial Update | 模型选择 (Unique/Aggregate/Duplicate) |
